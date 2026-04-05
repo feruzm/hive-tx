@@ -1,5 +1,5 @@
 import { bytesToHex } from '@noble/hashes/utils.js'
-import { Transaction, utils } from 'hive-tx'
+import { Transaction, utils } from '../src/index.js'
 import { getTransactionHex } from './getTransactionHex'
 import { Client } from 'pg'
 

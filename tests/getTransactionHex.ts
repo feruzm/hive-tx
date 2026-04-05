@@ -1,5 +1,5 @@
 import { sha256 } from '@noble/hashes/sha2.js'
-import { callRPC, config, TransactionType } from 'hive-tx'
+import { callRPC, config, TransactionType } from '../src/index.js'
 import { bytesToHex, hexToBytes } from '@noble/hashes/utils.js'
 const CHAIN_ID = hexToBytes(config.chain_id)
 

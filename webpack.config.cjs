@@ -12,7 +12,10 @@ module.exports = [
       iife: true
     },
     devtool: 'source-map',
-    resolve: { extensions: ['.ts'] },
+    resolve: {
+      extensions: ['.ts', '.js'],
+      extensionAlias: { '.js': ['.ts', '.js'] }
+    },
     module: {
       rules: [{ test: /\.ts$/, use: 'ts-loader' }]
     },

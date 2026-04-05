@@ -1,6 +1,6 @@
-import { config } from '../config'
-import { APIMethods, APIPaths, CallResponse } from '../types'
-import { sleep } from './sleep'
+import { config } from '../config.js'
+import { APIMethods, APIPaths, CallResponse } from '../types.js'
+import { sleep } from './sleep.js'
 
 // ── Error Types ─────────────────────────────────────────────────────────────
 
@@ -582,8 +582,6 @@ function findConsensus(results: any[], quorum: number) {
     }
     resultGroups.get(key)!.push(result)
   }
-  const consensusGroup = Array.from(resultGroups.values()).find(
-    (group) => group.length >= quorum
-  )
+  const consensusGroup = Array.from(resultGroups.values()).find((group) => group.length >= quorum)
   return consensusGroup ? consensusGroup[0] : null
 }

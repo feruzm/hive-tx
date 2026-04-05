@@ -9,7 +9,7 @@ import {
   config,
   callRPC,
   callWithQuorum
-} from 'hive-tx'
+} from '../src/index.js'
 
 // Test data
 const testPrivateKey = '5JdeC9P7Pbd1uGdFVEsJ41EkEnADbbHGq6p1BwFxm6txNBsQnsw'
