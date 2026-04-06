@@ -57,33 +57,91 @@ function isPreConnectionError(e: any): boolean {
 
 // ── Node Health Tracker ─────────────────────────────────────────────────────
 
+/** Node-level health state tracked by NodeHealthTracker. */
 interface NodeHealth {
+  /** Global consecutive-failure counter. Resets on success. */
   consecutiveFailures: number
+  /** Timestamp of the most recent failure. Used with the 30s cooldown window. */
   lastFailureTime: number
+  /** Epoch ms after which the node is no longer rate-limited. */
   rateLimitedUntil: number
+  /** Per-API failure counters. Some nodes disable specific API plugins; tracking
+   * per-API lets us deprioritize a node only for the APIs that fail, not globally. */
+  apiFailures: Map<string, { count: number; cooldownUntil: number; lastFailureTime: number }>
+  /** Most recent head_block_number observed for this node. */
+  headBlock: number
+  /** Epoch ms when the head_block was recorded. Used to expire stale observations. */
+  headBlockUpdatedAt: number
 }
 
-class NodeHealthTracker {
+/** Extract the API prefix from a method name like "rc_api.find_rc_accounts" -> "rc_api". */
+function apiOf(method: string): string {
+  const dot = method.indexOf('.')
+  return dot > 0 ? method.slice(0, dot) : method
+}
+
+/** Per-API failure threshold before the node is deprioritized for that API only. */
+const MAX_API_FAILURES_BEFORE_COOLDOWN = 2
+/** How long a node stays deprioritized for a specific API after repeated failures. */
+const API_COOLDOWN_MS = 60_000
+/** How long head_block observations remain valid before being treated as unknown. */
+const HEAD_BLOCK_MAX_AGE_MS = 120_000
+/** Maximum lag (in blocks) before a node is considered stale relative to the best-known head. */
+const STALE_BLOCK_THRESHOLD = 30
+
+/** @internal Exported for testing only. */
+export class NodeHealthTracker {
   private health = new Map<string, NodeHealth>()
 
   private getOrCreate(node: string): NodeHealth {
     let h = this.health.get(node)
     if (!h) {
-      h = { consecutiveFailures: 0, lastFailureTime: 0, rateLimitedUntil: 0 }
+      h = {
+        consecutiveFailures: 0,
+        lastFailureTime: 0,
+        rateLimitedUntil: 0,
+        apiFailures: new Map(),
+        headBlock: 0,
+        headBlockUpdatedAt: 0
+      }
       this.health.set(node, h)
     }
     return h
   }
 
-  recordSuccess(node: string): void {
+  recordSuccess(node: string, api?: string): void {
     const h = this.getOrCreate(node)
     h.consecutiveFailures = 0
+    if (api) {
+      // A successful API call clears that API's failure counter.
+      h.apiFailures.delete(api)
+    }
   }
 
-  recordFailure(node: string): void {
+  recordFailure(node: string, api?: string): void {
     const h = this.getOrCreate(node)
     h.consecutiveFailures++
     h.lastFailureTime = Date.now()
+    if (api) {
+      const now = Date.now()
+      const existing: { count: number; cooldownUntil: number; lastFailureTime: number } =
+        h.apiFailures.get(api) ?? { count: 0, cooldownUntil: 0, lastFailureTime: 0 }
+      // Reset counter if previous cooldown expired OR last failure was >30s ago
+      // (avoids sticky penalties from sparse failures hours apart)
+      if (
+        (existing.cooldownUntil > 0 && existing.cooldownUntil <= now) ||
+        (existing.lastFailureTime > 0 && now - existing.lastFailureTime > 30_000)
+      ) {
+        existing.count = 0
+        existing.cooldownUntil = 0
+      }
+      existing.count++
+      existing.lastFailureTime = now
+      if (existing.count >= MAX_API_FAILURES_BEFORE_COOLDOWN) {
+        existing.cooldownUntil = now + API_COOLDOWN_MS
+      }
+      h.apiFailures.set(api, existing)
+    }
   }
 
   recordRateLimit(node: string, retryAfterMs = 10_000): void {
@@ -93,25 +151,72 @@ class NodeHealthTracker {
     h.lastFailureTime = Date.now()
   }
 
-  isNodeHealthy(node: string): boolean {
+  /** Record an observed head_block_number for this node. */
+  recordHeadBlock(node: string, blockNum: number): void {
+    if (!blockNum || !Number.isFinite(blockNum)) return
+    const h = this.getOrCreate(node)
+    h.headBlock = blockNum
+    h.headBlockUpdatedAt = Date.now()
+  }
+
+  /**
+   * Consensus head block from recent observations. Uses the median rather than the
+   * max to prevent a single bad/misconfigured node from poisoning the reference.
+   * A node reporting an inflated head_block won't affect the median unless the
+   * majority of nodes agree on that range.
+   */
+  private consensusHeadBlock(): number {
+    const now = Date.now()
+    const recent: number[] = []
+    for (const h of this.health.values()) {
+      if (h.headBlock > 0 && now - h.headBlockUpdatedAt <= HEAD_BLOCK_MAX_AGE_MS) {
+        recent.push(h.headBlock)
+      }
+    }
+    if (recent.length < 2) return 0 // Need at least 2 observations to compare
+    recent.sort((a, b) => a - b)
+    // Median: for even length, use the lower-middle value (conservative)
+    return recent[Math.floor((recent.length - 1) / 2)]
+  }
+
+  /** True if this node is healthy (globally and for the given API if provided). */
+  isNodeHealthy(node: string, api?: string): boolean {
     const h = this.health.get(node)
     if (!h) return true // unknown nodes assumed healthy
+    const now = Date.now()
 
     // Rate-limited and cooldown hasn't expired
-    if (h.rateLimitedUntil > Date.now()) return false
+    if (h.rateLimitedUntil > now) return false
 
     // Too many consecutive failures within the last 30 seconds
-    if (h.consecutiveFailures >= 3 && Date.now() - h.lastFailureTime < 30_000) return false
+    if (h.consecutiveFailures >= 3 && now - h.lastFailureTime < 30_000) return false
+
+    // Per-API cooldown: node may be healthy overall but missing this API plugin
+    if (api) {
+      const apiFail = h.apiFailures.get(api)
+      if (apiFail && apiFail.cooldownUntil > now) return false
+    }
+
+    // Head-block staleness: deprioritize nodes lagging behind the consensus head
+    const best = this.consensusHeadBlock()
+    if (
+      best > 0 &&
+      h.headBlock > 0 &&
+      now - h.headBlockUpdatedAt <= HEAD_BLOCK_MAX_AGE_MS &&
+      best - h.headBlock > STALE_BLOCK_THRESHOLD
+    ) {
+      return false
+    }
 
     return true
   }
 
   /** Return nodes sorted: healthy first (preserving order), unhealthy appended. */
-  getOrderedNodes(nodes: string[]): string[] {
+  getOrderedNodes(nodes: string[], api?: string): string[] {
     const healthy: string[] = []
     const unhealthy: string[] = []
     for (const node of nodes) {
-      if (this.isNodeHealthy(node)) {
+      if (this.isNodeHealthy(node, api)) {
         healthy.push(node)
       } else {
         unhealthy.push(node)
@@ -127,15 +232,34 @@ const restHealthTracker = new NodeHealthTracker()
 // ── Internal helpers ────────────────────────────────────────────────────────
 
 /** Record a caught error on the health tracker (handles NodeError to avoid double-counting). */
-function recordError(tracker: NodeHealthTracker, node: string, e: any): void {
+function recordError(tracker: NodeHealthTracker, node: string, e: any, api?: string): void {
   if (e instanceof NodeError) {
     if (e.rateLimitMs > 0) {
       tracker.recordRateLimit(node, e.rateLimitMs)
     } else {
-      tracker.recordFailure(node)
+      tracker.recordFailure(node, api)
     }
   } else {
-    tracker.recordFailure(node)
+    tracker.recordFailure(node, api)
+  }
+}
+
+/**
+ * Passively extract head_block_number from known RPC responses
+ * (e.g. `condenser_api.get_dynamic_global_properties`, `database_api.get_dynamic_global_properties`).
+ * Silently ignores responses without that shape.
+ */
+function tryRecordHeadBlock(
+  tracker: NodeHealthTracker,
+  node: string,
+  method: string,
+  result: any
+): void {
+  if (!result || typeof result !== 'object') return
+  if (!method.includes('get_dynamic_global_properties')) return
+  const block = (result as any).head_block_number
+  if (typeof block === 'number') {
+    tracker.recordHeadBlock(node, block)
   }
 }
 
@@ -262,6 +386,7 @@ export const callRPC = async <T = any>(
   if (config.nodes.length === 0) {
     throw new Error('config.nodes is empty')
   }
+  const api = apiOf(method)
   // Track nodes tried in the current round. When all nodes have been tried,
   // clear the set to allow a second round (wrap-around) using the retry budget.
   const triedInRound = new Set<string>()
@@ -269,7 +394,8 @@ export const callRPC = async <T = any>(
 
   for (let attempt = 0; attempt <= retry; attempt++) {
     // Re-evaluate node order each attempt so health changes are respected.
-    const orderedNodes = rpcHealthTracker.getOrderedNodes(config.nodes)
+    // Pass api so nodes with an API-specific cooldown are deprioritized.
+    const orderedNodes = rpcHealthTracker.getOrderedNodes(config.nodes, api)
     // Pick the healthiest untried node. If all tried, start a new round.
     let node = orderedNodes.find((n) => !triedInRound.has(n))
     if (!node) {
@@ -279,14 +405,15 @@ export const callRPC = async <T = any>(
     triedInRound.add(node)
     try {
       const res = await jsonRPCCall(node, method, params, timeout)
-      rpcHealthTracker.recordSuccess(node)
+      rpcHealthTracker.recordSuccess(node, api)
+      tryRecordHeadBlock(rpcHealthTracker, node, method, res)
       return res as T
     } catch (e: any) {
       // RPCErrors are valid blockchain rejections - never retry
       if (e instanceof RPCError) {
         throw e
       }
-      recordError(rpcHealthTracker, node, e)
+      recordError(rpcHealthTracker, node, e, api)
       lastError = e
 
       // Add jitter before trying next node
@@ -322,26 +449,27 @@ export const callRPCBroadcast = async <T = any>(
   if (config.nodes.length === 0) {
     throw new Error('config.nodes is empty')
   }
+  const api = apiOf(method)
   // Track which nodes we've already tried - broadcasts must never retry the same node
   const triedNodes = new Set<string>()
   let lastError: any
 
   for (let attempt = 0; attempt < config.nodes.length; attempt++) {
     // Re-evaluate order each attempt so health changes are respected
-    const orderedNodes = rpcHealthTracker.getOrderedNodes(config.nodes)
+    const orderedNodes = rpcHealthTracker.getOrderedNodes(config.nodes, api)
     const node = orderedNodes.find((n) => !triedNodes.has(n))
     if (!node) break
     triedNodes.add(node)
     try {
       const res = await jsonRPCCall(node, method, params, timeout)
-      rpcHealthTracker.recordSuccess(node)
+      rpcHealthTracker.recordSuccess(node, api)
       return res as T
     } catch (e: any) {
       // RPCErrors are valid blockchain rejections - never retry
       if (e instanceof RPCError) {
         throw e
       }
-      recordError(rpcHealthTracker, node, e)
+      recordError(rpcHealthTracker, node, e, api)
       lastError = e
 
       // Only retry broadcasts on pre-connection errors where the request
@@ -446,7 +574,8 @@ export async function callREST<Api extends APIMethods, P extends keyof APIPaths[
 
   for (let attempt = 0; attempt <= retry; attempt++) {
     // Re-evaluate node order each attempt so health changes are respected.
-    const orderedNodes = restHealthTracker.getOrderedNodes(config.restNodes)
+    // Pass api so per-API cooldowns are respected.
+    const orderedNodes = restHealthTracker.getOrderedNodes(config.restNodes, api)
     let node = orderedNodes.find((n) => !triedInRound.has(n))
     if (!node) {
       triedInRound.clear()
@@ -493,11 +622,11 @@ export async function callREST<Api extends APIMethods, P extends keyof APIPaths[
         throw new Error(`HTTP 429 Rate Limited by ${node}`)
       }
       if (response.status === 503) {
-        restHealthTracker.recordFailure(node)
+        restHealthTracker.recordFailure(node, api)
         alreadyRecorded = true
         throw new Error(`HTTP 503 Service Unavailable from ${node}`)
       }
-      restHealthTracker.recordSuccess(node)
+      restHealthTracker.recordSuccess(node, api)
       return response.json() as any
     } catch (e: any) {
       // 404 is not a node issue, don't failover
@@ -506,7 +635,7 @@ export async function callREST<Api extends APIMethods, P extends keyof APIPaths[
       }
       // Only record if not already recorded by 429/503 handler above
       if (!alreadyRecorded) {
-        restHealthTracker.recordFailure(node)
+        restHealthTracker.recordFailure(node, api)
       }
       lastError = e
 
