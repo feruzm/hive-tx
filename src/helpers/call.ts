@@ -120,9 +120,10 @@ export class NodeHealthTracker {
 
   recordFailure(node: string, api?: string): void {
     const h = this.getOrCreate(node)
-    h.consecutiveFailures++
-    h.lastFailureTime = Date.now()
     if (api) {
+      // API-specific failure: only update the per-API tracker.
+      // This prevents e.g. 3 rc_api failures from marking the node
+      // globally unhealthy for condenser_api too.
       const now = Date.now()
       const existing: { count: number; cooldownUntil: number; lastFailureTime: number } =
         h.apiFailures.get(api) ?? { count: 0, cooldownUntil: 0, lastFailureTime: 0 }
@@ -141,6 +142,10 @@ export class NodeHealthTracker {
         existing.cooldownUntil = now + API_COOLDOWN_MS
       }
       h.apiFailures.set(api, existing)
+    } else {
+      // Transport-level failure (no specific API): update global counter
+      h.consecutiveFailures++
+      h.lastFailureTime = Date.now()
     }
   }
 
@@ -274,7 +279,10 @@ function createTimeoutSignal(ms: number): { signal: AbortSignal; cleanup: () => 
   }
   const controller = new AbortController()
   const timer = setTimeout(
-    () => controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')),
+    () =>
+      controller.abort(
+        new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+      ),
     ms
   )
   return { signal: controller.signal, cleanup: () => clearTimeout(timer) }
@@ -294,8 +302,14 @@ function mergeSignals(
   }
   // Fallback: controller that aborts with the winning signal's reason
   const controller = new AbortController()
-  if (primary.aborted) { controller.abort(primary.reason); return { signal: controller.signal, cleanup: () => {} } }
-  if (secondary.aborted) { controller.abort(secondary.reason); return { signal: controller.signal, cleanup: () => {} } }
+  if (primary.aborted) {
+    controller.abort(primary.reason)
+    return { signal: controller.signal, cleanup: () => {} }
+  }
+  if (secondary.aborted) {
+    controller.abort(secondary.reason)
+    return { signal: controller.signal, cleanup: () => {} }
+  }
 
   const onPrimaryAbort = () => controller.abort(primary.reason)
   const onSecondaryAbort = () => controller.abort(secondary.reason)
@@ -336,7 +350,10 @@ const jsonRPCCall = async (
   // or AbortSignal.any (pre-Chrome 116).
   const { signal: tSignal, cleanup: cleanupTimeout } = createTimeoutSignal(timeout)
   const { signal, cleanup: cleanupMerge } = mergeSignals(tSignal, externalSignal)
-  const cleanup = () => { cleanupTimeout(); cleanupMerge() }
+  const cleanup = () => {
+    cleanupTimeout()
+    cleanupMerge()
+  }
 
   try {
     const res = await fetch(url, {

@@ -95,6 +95,18 @@ console.log('\nPer-API cooldown:')
   assert(t.isNodeHealthy('https://a', 'rc_api') === true, 'sparse failures reset counter (no sticky penalty)')
 }
 
+{
+  // 3+ API-specific failures must NOT poison the node globally
+  const t = new NodeHealthTracker()
+  t.recordFailure('https://a', 'rc_api')
+  t.recordFailure('https://a', 'rc_api')
+  t.recordFailure('https://a', 'rc_api')
+  t.recordFailure('https://a', 'rc_api')
+  assert(t.isNodeHealthy('https://a', 'rc_api') === false, '4 rc_api failures -> rc_api unhealthy')
+  assert(t.isNodeHealthy('https://a', 'condenser_api') === true, 'condenser_api still healthy after 4 rc_api failures')
+  assert(t.isNodeHealthy('https://a') === true, 'globally still healthy after 4 rc_api failures')
+}
+
 // ── getOrderedNodes with API ───────────────────────────────────────────────
 console.log('\ngetOrderedNodes with API:')
 {
