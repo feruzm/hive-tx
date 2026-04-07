@@ -67,6 +67,16 @@ export class Signature {
   }
 
   /**
+   * Returns signature as 130-character hex string.
+   * Overrides Object.prototype.toString() so that String(sig) and
+   * template literals produce the hex representation instead of "[object Object]".
+   * @returns Hex string representation of signature
+   */
+  toString() {
+    return this.customToString()
+  }
+
+  /**
    * Recovers the public key from this signature and message.
    * @param message 32-byte message hash (Uint8Array) or 64-character hex string
    * @returns PublicKey that created this signature
