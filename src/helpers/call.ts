@@ -274,7 +274,8 @@ const jsonRPCCall = async (
   method: string,
   params: any,
   timeout = config.timeout,
-  shouldRetry = false
+  shouldRetry = false,
+  externalSignal?: AbortSignal
 ) => {
   const id = Math.floor(Math.random() * 100_000_000)
   const body = {
@@ -284,11 +285,16 @@ const jsonRPCCall = async (
     id
   }
   try {
+    // Merge the per-call timeout with any external abort signal (e.g., SSR
+    // request cancellation). Either one firing cancels the fetch.
+    const timeoutSignal = AbortSignal.timeout(timeout)
+    const signal = externalSignal ? AbortSignal.any([timeoutSignal, externalSignal]) : timeoutSignal
+
     const res = await fetch(url, {
       method: 'POST',
       body: JSON.stringify(body),
       headers: { 'Content-Type': 'application/json' },
-      signal: AbortSignal.timeout(timeout)
+      signal
     })
 
     // Handle HTTP-level errors before parsing JSON.
@@ -332,7 +338,7 @@ const jsonRPCCall = async (
       throw e
     }
     if (shouldRetry) {
-      return jsonRPCCall(url, method, params, timeout, false)
+      return jsonRPCCall(url, method, params, timeout, false, externalSignal)
     }
     throw e
   }
@@ -378,7 +384,8 @@ export const callRPC = async <T = any>(
   method: string,
   params: any[] | object = [],
   timeout = config.timeout,
-  retry = config.retry
+  retry = config.retry,
+  signal?: AbortSignal
 ): Promise<T> => {
   if (!Array.isArray(config.nodes)) {
     throw new Error('config.nodes is not an array')
@@ -404,13 +411,17 @@ export const callRPC = async <T = any>(
     }
     triedInRound.add(node)
     try {
-      const res = await jsonRPCCall(node, method, params, timeout)
+      const res = await jsonRPCCall(node, method, params, timeout, false, signal)
       rpcHealthTracker.recordSuccess(node, api)
       tryRecordHeadBlock(rpcHealthTracker, node, method, res)
       return res as T
     } catch (e: any) {
       // RPCErrors are valid blockchain rejections - never retry
       if (e instanceof RPCError) {
+        throw e
+      }
+      // External abort — stop retrying immediately
+      if (signal?.aborted) {
         throw e
       }
       recordError(rpcHealthTracker, node, e, api)
