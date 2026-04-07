@@ -263,6 +263,52 @@ function tryRecordHeadBlock(
   }
 }
 
+// ── AbortSignal helpers (browser fallbacks) ─────────────────────────────────
+
+/** AbortSignal.timeout polyfill for pre-Chrome 103 / pre-Safari 16.4.
+ *  Returns { signal, cleanup } — caller must invoke cleanup() on success
+ *  to clear the dangling timer. */
+function createTimeoutSignal(ms: number): { signal: AbortSignal; cleanup: () => void } {
+  if (typeof AbortSignal.timeout === 'function') {
+    return { signal: AbortSignal.timeout(ms), cleanup: () => {} }
+  }
+  const controller = new AbortController()
+  const timer = setTimeout(
+    () => controller.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError')),
+    ms
+  )
+  return { signal: controller.signal, cleanup: () => clearTimeout(timer) }
+}
+
+/** AbortSignal.any polyfill for pre-Chrome 116 / pre-Safari 17.4.
+ *  Returns { signal, cleanup } — caller must invoke cleanup() on success
+ *  to remove listeners from the input signals (prevents leaks when the
+ *  same long-lived signal is reused across many callRPC invocations). */
+function mergeSignals(
+  primary: AbortSignal,
+  secondary?: AbortSignal
+): { signal: AbortSignal; cleanup: () => void } {
+  if (!secondary) return { signal: primary, cleanup: () => {} }
+  if (typeof AbortSignal.any === 'function') {
+    return { signal: AbortSignal.any([primary, secondary]), cleanup: () => {} }
+  }
+  // Fallback: controller that aborts with the winning signal's reason
+  const controller = new AbortController()
+  if (primary.aborted) { controller.abort(primary.reason); return { signal: controller.signal, cleanup: () => {} } }
+  if (secondary.aborted) { controller.abort(secondary.reason); return { signal: controller.signal, cleanup: () => {} } }
+
+  const onPrimaryAbort = () => controller.abort(primary.reason)
+  const onSecondaryAbort = () => controller.abort(secondary.reason)
+  primary.addEventListener('abort', onPrimaryAbort, { once: true })
+  secondary.addEventListener('abort', onSecondaryAbort, { once: true })
+
+  const cleanup = () => {
+    primary.removeEventListener('abort', onPrimaryAbort)
+    secondary.removeEventListener('abort', onSecondaryAbort)
+  }
+  return { signal: controller.signal, cleanup }
+}
+
 /**
  * Low-level JSON-RPC call to a single node. No failover.
  * Throws RPCError for blockchain rejections, NodeError for HTTP 429/503,
@@ -284,12 +330,15 @@ const jsonRPCCall = async (
     params,
     id
   }
-  try {
-    // Merge the per-call timeout with any external abort signal (e.g., SSR
-    // request cancellation). Either one firing cancels the fetch.
-    const timeoutSignal = AbortSignal.timeout(timeout)
-    const signal = externalSignal ? AbortSignal.any([timeoutSignal, externalSignal]) : timeoutSignal
+  // Merge the per-call timeout with any external abort signal (e.g., SSR
+  // request cancellation). Either one firing cancels the fetch.
+  // Fallbacks for browsers without AbortSignal.timeout (pre-Chrome 103)
+  // or AbortSignal.any (pre-Chrome 116).
+  const { signal: tSignal, cleanup: cleanupTimeout } = createTimeoutSignal(timeout)
+  const { signal, cleanup: cleanupMerge } = mergeSignals(tSignal, externalSignal)
+  const cleanup = () => { cleanupTimeout(); cleanupMerge() }
 
+  try {
     const res = await fetch(url, {
       method: 'POST',
       body: JSON.stringify(body),
@@ -341,6 +390,8 @@ const jsonRPCCall = async (
       return jsonRPCCall(url, method, params, timeout, false, externalSignal)
     }
     throw e
+  } finally {
+    cleanup()
   }
 }
 
@@ -618,9 +669,10 @@ export async function callREST<Api extends APIMethods, P extends keyof APIPaths[
     })
 
     alreadyRecorded = false
+    const { signal: restSignal, cleanup: restCleanup } = createTimeoutSignal(timeout)
     try {
       const response = await fetch(url.toString(), {
-        signal: AbortSignal.timeout(timeout)
+        signal: restSignal
       })
       if (response.status === 404) {
         throw new Error('HTTP 404 - Hint: can happen on wrong params')
@@ -653,6 +705,8 @@ export async function callREST<Api extends APIMethods, P extends keyof APIPaths[
       if (attempt < retry) {
         await jitterDelay()
       }
+    } finally {
+      restCleanup()
     }
   }
 
