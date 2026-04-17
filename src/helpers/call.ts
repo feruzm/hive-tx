@@ -74,6 +74,28 @@ interface NodeHealth {
   headBlockUpdatedAt: number
 }
 
+/**
+ * JSON-RPC error codes that indicate the node itself is unhealthy, not that the
+ * client sent a bad request. These should trigger failover to another node.
+ *
+ * Background: Hive nodes fronted by HAF/jussi/drone return HTTP 200 with a
+ * JSON-RPC error body when a backing service (hivemind, postgrest, etc.) is down.
+ * The HTTP layer looks healthy, so failover never triggers — the caller just gets
+ * an error and gives up. This function identifies those node-level errors.
+ */
+function isNodeLevelRPCError(code: number, message: string): boolean {
+  // -32603: Internal error — node is having problems
+  if (code === -32603) return true
+  // -32000 to -32099: Server error range (implementation-defined server errors)
+  if (code <= -32000 && code >= -32099) return true
+  // -32601: Method not found — node may be missing this API plugin
+  if (code === -32601) return true
+  // -32602 with node-sick indicators (vs normal "invalid params" from bad client input)
+  // e.g. "Unable to parse endpoint data" from HAF when a backing service is down
+  if (code === -32602 && /unable to parse|endpoint data|internal/i.test(message)) return true
+  return false
+}
+
 /** Extract the API prefix from a method name like "rc_api.find_rc_accounts" -> "rc_api". */
 function apiOf(method: string): string {
   const dot = method.indexOf('.')
@@ -270,6 +292,22 @@ function tryRecordHeadBlock(
 
 // ── AbortSignal helpers (browser fallbacks) ─────────────────────────────────
 
+/**
+ * Build a TimeoutError "reason" for an aborted signal.
+ * Prefers the standard `DOMException` when available. Runtimes that ship
+ * `AbortController` without `DOMException` (notably React Native / Hermes,
+ * old Node < 17) fall back to a plain Error tagged with `name: 'TimeoutError'`
+ * — which is what consumers actually check on `signal.reason`.
+ */
+function createTimeoutReason(): Error {
+  if (typeof DOMException !== 'undefined') {
+    return new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+  }
+  const err = new Error('The operation was aborted due to timeout')
+  err.name = 'TimeoutError'
+  return err
+}
+
 /** AbortSignal.timeout polyfill for pre-Chrome 103 / pre-Safari 16.4.
  *  Returns { signal, cleanup } — caller must invoke cleanup() on success
  *  to clear the dangling timer. */
@@ -278,13 +316,7 @@ function createTimeoutSignal(ms: number): { signal: AbortSignal; cleanup: () => 
     return { signal: AbortSignal.timeout(ms), cleanup: () => {} }
   }
   const controller = new AbortController()
-  const timer = setTimeout(
-    () =>
-      controller.abort(
-        new DOMException('The operation was aborted due to timeout', 'TimeoutError')
-      ),
-    ms
-  )
+  const timer = setTimeout(() => controller.abort(createTimeoutReason()), ms)
   return { signal: controller.signal, cleanup: () => clearTimeout(timer) }
 }
 
@@ -484,9 +516,15 @@ export const callRPC = async <T = any>(
       tryRecordHeadBlock(rpcHealthTracker, node, method, res)
       return res as T
     } catch (e: any) {
-      // RPCErrors are valid blockchain rejections - never retry
+      // RPCErrors: distinguish node-level failures from genuine blockchain rejections.
+      // Node-level errors (e.g. -32602 "Unable to parse endpoint data" from a sick
+      // HAF/jussi backend) should failover; real rejections (bad params, missing
+      // authority, etc.) propagate immediately.
       if (e instanceof RPCError) {
-        throw e
+        if (!isNodeLevelRPCError(e.code, e.message)) {
+          throw e
+        }
+        // Node-level RPC error — record failure and fall through to failover
       }
       // External abort — stop retrying immediately
       if (signal?.aborted) {
